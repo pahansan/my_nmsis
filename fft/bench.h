@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 
 typedef float float32_t;
 
@@ -98,9 +99,18 @@ __STATIC_FORCEINLINE uint64_t __get_rv_cycle(void)
 #endif
 }
 
+uint64_t wtime(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) == -1)
+        return 0;
+
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
 #ifndef READ_CYCLE
 /** Read run cycle of cpu */
-#define READ_CYCLE __get_rv_cycle
+#define READ_CYCLE wtime
 #endif
 
 /** Start to do benchmark for proc, and record start cycle, and reset error code */

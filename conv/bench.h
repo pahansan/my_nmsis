@@ -4,6 +4,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
+#include <string.h>
 
 typedef float float32_t;
 
@@ -98,9 +100,18 @@ __STATIC_FORCEINLINE uint64_t __get_rv_cycle(void)
 #endif
 }
 
+uint64_t wtime(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) == -1)
+        return 0;
+
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
 #ifndef READ_CYCLE
 /** Read run cycle of cpu */
-#define READ_CYCLE __get_rv_cycle
+#define READ_CYCLE wtime
 #endif
 
 /** Start to do benchmark for proc, and record start cycle, and reset error code */
@@ -8961,4 +8972,2438 @@ RISCV_DSP_ATTRIBUTE riscv_status riscv_conv_partial_fast_opt_q15(
     /* Return to application */
     return (status);
 #endif /* defined (RISCV_MATH_VECTOR) */
+}
+
+#define TEST_LENGTH_SAMPLES 1024
+#define NUM_TAPS 32 /* Must be even */
+
+static float32_t testInput_f32_50Hz_200Hz[TEST_LENGTH_SAMPLES] = {};
+
+static float32_t firCoeffs32LP[NUM_TAPS] = {
+    -0.001822523074f, -0.001587929321f, 1.226008847e-18f, 0.003697750857f, 0.008075430058f,
+    0.008530221879f, -4.273456581e-18f, -0.01739769801f, -0.03414586186f, -0.03335915506f,
+    8.073562366e-18f, 0.06763084233f, 0.1522061825f, 0.2229246944f, 0.2504960895f,
+    0.2229246944f, 0.1522061825f, 0.06763084233f, 8.073562366e-18f, -0.03335915506f,
+    -0.03414586186f, -0.01739769801f, -4.273456581e-18f, 0.008530221879f, 0.008075430058f,
+    0.003697750857f, 1.226008847e-18f, -0.001587929321f, -0.001822523074f, 0.0f,
+    0.12343084233f, -0.0345061825f};
+
+/**
+ * @brief 8-bit fractional data type in 1.7 format.
+ */
+typedef int8_t q7_t;
+
+/**
+ * @brief 16-bit fractional data type in 1.15 format.
+ */
+typedef int16_t q15_t;
+
+/**
+ * @brief 64-bit floating-point type definition.
+ */
+typedef double float64_t;
+
+typedef struct
+{
+    uint16_t numTaps;    /**< number of filter coefficients in the filter. */
+    q7_t *pState;        /**< points to the state variable array. The array is of length numTaps+blockSize-1. */
+    const q7_t *pCoeffs; /**< points to the coefficient array. The array is of length numTaps.*/
+} riscv_fir_instance_q7;
+
+/**
+ * @brief Instance structure for the Q15 FIR filter.
+ */
+typedef struct
+{
+    uint16_t numTaps;     /**< number of filter coefficients in the filter. */
+    q15_t *pState;        /**< points to the state variable array. The array is of length numTaps+blockSize-1. */
+    const q15_t *pCoeffs; /**< points to the coefficient array. The array is of length numTaps.*/
+} riscv_fir_instance_q15;
+
+/**
+ * @brief Instance structure for the Q31 FIR filter.
+ */
+typedef struct
+{
+    uint16_t numTaps;     /**< number of filter coefficients in the filter. */
+    q31_t *pState;        /**< points to the state variable array. The array is of length numTaps+blockSize-1. */
+    const q31_t *pCoeffs; /**< points to the coefficient array. The array is of length numTaps. */
+} riscv_fir_instance_q31;
+
+/**
+ * @brief Instance structure for the floating-point FIR filter.
+ */
+typedef struct
+{
+    uint16_t numTaps;         /**< number of filter coefficients in the filter. */
+    float32_t *pState;        /**< points to the state variable array. The array is of length numTaps+blockSize-1. */
+    const float32_t *pCoeffs; /**< points to the coefficient array. The array is of length numTaps. */
+} riscv_fir_instance_f32;
+
+/**
+ * @brief Instance structure for the floating-point FIR filter.
+ */
+typedef struct
+{
+    uint16_t numTaps;         /**< number of filter coefficients in the filter. */
+    float64_t *pState;        /**< points to the state variable array. The array is of length numTaps+blockSize-1. */
+    const float64_t *pCoeffs; /**< points to the coefficient array. The array is of length numTaps. */
+} riscv_fir_instance_f64;
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_init_f32(
+    riscv_fir_instance_f32 *S,
+    uint16_t numTaps,
+    const float32_t *pCoeffs,
+    float32_t *pState,
+    uint32_t blockSize)
+{
+    /* Assign filter taps */
+    S->numTaps = numTaps;
+
+    /* Assign coefficient pointer */
+    S->pCoeffs = pCoeffs;
+
+    /* Clear state buffer. The size is always (blockSize + numTaps - 1) */
+    memset(pState, 0, (numTaps + (blockSize - 1U)) * sizeof(float32_t));
+    /* Assign state pointer */
+    S->pState = pState;
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_f32(
+    const riscv_fir_instance_f32 *S,
+    const float32_t *pSrc,
+    float32_t *pDst,
+    uint32_t blockSize)
+{
+    float32_t *pState = S->pState;         /* State pointer */
+    const float32_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    float32_t *pStateCurnt;                /* Points to the current sample of the state */
+    float32_t *px;                         /* Temporary pointer for state buffer */
+    const float32_t *pb;                   /* Temporary pointer for coefficient buffer */
+    float32_t acc0;                        /* Accumulator */
+    uint32_t numTaps = S->numTaps;         /* Number of filter coefficients in the filter */
+    uint32_t i, tapCnt, blkCnt;            /* Loop counters */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+    float32_t acc1, acc2, acc3, acc4, acc5, acc6, acc7; /* Accumulators */
+    float32_t x0, x1, x2, x3, x4, x5, x6, x7;           /* Temporary variables to hold state values */
+    float32_t c0;                                       /* Temporary variable to hold coefficient value */
+#endif
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+#if defined(RISCV_MATH_VECTOR)
+    uint32_t j;
+    size_t l;
+    vfloat32m8_t vx, vres0m8;
+    float32_t *pOut = pDst;
+    /* Copy samples into state buffer */
+    riscv_copy_f32(pSrc, pStateCurnt, blockSize);
+    for (i = blockSize; i > 0; i -= l)
+    {
+        l = __riscv_vsetvl_e32m8(i);
+        vx = __riscv_vle32_v_f32m8(pState, l);
+        pState += l;
+        vres0m8 = __riscv_vfmv_v_f_f32m8(0.0, l);
+        for (j = 0; j < numTaps; j++)
+        {
+            vres0m8 = __riscv_vfmacc_vf_f32m8(vres0m8, *(pCoeffs + j), vx, l);
+            vx = __riscv_vfslide1down_vf_f32m8(vx, *(pState + j), l);
+        }
+        __riscv_vse32_v_f32m8(pOut, vres0m8, l);
+        pOut += l;
+    }
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+    /* Copy data */
+    riscv_copy_f32(pState, pStateCurnt, numTaps - 1);
+#else
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 8 output values simultaneously.
+     * The variables acc0 ... acc7 hold output values that are being computed:
+     *
+     *    acc0 =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0]
+     *    acc1 =  b[numTaps-1] * x[n-numTaps]   + b[numTaps-2] * x[n-numTaps-1] + b[numTaps-3] * x[n-numTaps-2] +...+ b[0] * x[1]
+     *    acc2 =  b[numTaps-1] * x[n-numTaps+1] + b[numTaps-2] * x[n-numTaps]   + b[numTaps-3] * x[n-numTaps-1] +...+ b[0] * x[2]
+     *    acc3 =  b[numTaps-1] * x[n-numTaps+2] + b[numTaps-2] * x[n-numTaps+1] + b[numTaps-3] * x[n-numTaps]   +...+ b[0] * x[3]
+     */
+
+    blkCnt = blockSize >> 3U;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy 4 new input samples into the state buffer. */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set all accumulators to zero */
+        acc0 = 0.0f;
+        acc1 = 0.0f;
+        acc2 = 0.0f;
+        acc3 = 0.0f;
+        acc4 = 0.0f;
+        acc5 = 0.0f;
+        acc6 = 0.0f;
+        acc7 = 0.0f;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize coefficient pointer */
+        pb = pCoeffs;
+
+        /* This is separated from the others to avoid
+         * a call to __aeabi_memmove which would be slower
+         */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Read the first 7 samples from the state buffer:  x[n-numTaps], x[n-numTaps-1], x[n-numTaps-2] */
+        x0 = *px++;
+        x1 = *px++;
+        x2 = *px++;
+        x3 = *px++;
+        x4 = *px++;
+        x5 = *px++;
+        x6 = *px++;
+
+        /* Loop unrolling: process 8 taps at a time. */
+        tapCnt = numTaps >> 3U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read the b[numTaps-1] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-3] sample */
+            x7 = *(px++);
+
+            /* acc0 +=  b[numTaps-1] * x[n-numTaps] */
+            acc0 += x0 * c0;
+
+            /* acc1 +=  b[numTaps-1] * x[n-numTaps-1] */
+            acc1 += x1 * c0;
+
+            /* acc2 +=  b[numTaps-1] * x[n-numTaps-2] */
+            acc2 += x2 * c0;
+
+            /* acc3 +=  b[numTaps-1] * x[n-numTaps-3] */
+            acc3 += x3 * c0;
+
+            /* acc4 +=  b[numTaps-1] * x[n-numTaps-4] */
+            acc4 += x4 * c0;
+
+            /* acc1 +=  b[numTaps-1] * x[n-numTaps-5] */
+            acc5 += x5 * c0;
+
+            /* acc2 +=  b[numTaps-1] * x[n-numTaps-6] */
+            acc6 += x6 * c0;
+
+            /* acc3 +=  b[numTaps-1] * x[n-numTaps-7] */
+            acc7 += x7 * c0;
+
+            /* Read the b[numTaps-2] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-4] sample */
+            x0 = *(px++);
+
+            /* Perform the multiply-accumulate */
+            acc0 += x1 * c0;
+            acc1 += x2 * c0;
+            acc2 += x3 * c0;
+            acc3 += x4 * c0;
+            acc4 += x5 * c0;
+            acc5 += x6 * c0;
+            acc6 += x7 * c0;
+            acc7 += x0 * c0;
+
+            /* Read the b[numTaps-3] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-5] sample */
+            x1 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += x2 * c0;
+            acc1 += x3 * c0;
+            acc2 += x4 * c0;
+            acc3 += x5 * c0;
+            acc4 += x6 * c0;
+            acc5 += x7 * c0;
+            acc6 += x0 * c0;
+            acc7 += x1 * c0;
+
+            /* Read the b[numTaps-4] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-6] sample */
+            x2 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += x3 * c0;
+            acc1 += x4 * c0;
+            acc2 += x5 * c0;
+            acc3 += x6 * c0;
+            acc4 += x7 * c0;
+            acc5 += x0 * c0;
+            acc6 += x1 * c0;
+            acc7 += x2 * c0;
+
+            /* Read the b[numTaps-4] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-6] sample */
+            x3 = *(px++);
+            /* Perform the multiply-accumulates */
+            acc0 += x4 * c0;
+            acc1 += x5 * c0;
+            acc2 += x6 * c0;
+            acc3 += x7 * c0;
+            acc4 += x0 * c0;
+            acc5 += x1 * c0;
+            acc6 += x2 * c0;
+            acc7 += x3 * c0;
+
+            /* Read the b[numTaps-4] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-6] sample */
+            x4 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += x5 * c0;
+            acc1 += x6 * c0;
+            acc2 += x7 * c0;
+            acc3 += x0 * c0;
+            acc4 += x1 * c0;
+            acc5 += x2 * c0;
+            acc6 += x3 * c0;
+            acc7 += x4 * c0;
+
+            /* Read the b[numTaps-4] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-6] sample */
+            x5 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += x6 * c0;
+            acc1 += x7 * c0;
+            acc2 += x0 * c0;
+            acc3 += x1 * c0;
+            acc4 += x2 * c0;
+            acc5 += x3 * c0;
+            acc6 += x4 * c0;
+            acc7 += x5 * c0;
+
+            /* Read the b[numTaps-4] coefficient */
+            c0 = *(pb++);
+
+            /* Read x[n-numTaps-6] sample */
+            x6 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += x7 * c0;
+            acc1 += x0 * c0;
+            acc2 += x1 * c0;
+            acc3 += x2 * c0;
+            acc4 += x3 * c0;
+            acc5 += x4 * c0;
+            acc6 += x5 * c0;
+            acc7 += x6 * c0;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* Loop unrolling: Compute remaining outputs */
+        tapCnt = numTaps % 0x8U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read coefficients */
+            c0 = *(pb++);
+
+            /* Fetch 1 state variable */
+            x7 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += x0 * c0;
+            acc1 += x1 * c0;
+            acc2 += x2 * c0;
+            acc3 += x3 * c0;
+            acc4 += x4 * c0;
+            acc5 += x5 * c0;
+            acc6 += x6 * c0;
+            acc7 += x7 * c0;
+
+            /* Reuse the present sample states for next sample */
+            x0 = x1;
+            x1 = x2;
+            x2 = x3;
+            x3 = x4;
+            x4 = x5;
+            x5 = x6;
+            x6 = x7;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* Advance the state pointer by 8 to process the next group of 8 samples */
+        pState = pState + 8;
+
+        /* The results in the 8 accumulators, store in the destination buffer. */
+        *pDst++ = acc0;
+        *pDst++ = acc1;
+        *pDst++ = acc2;
+        *pDst++ = acc3;
+        *pDst++ = acc4;
+        *pDst++ = acc5;
+        *pDst++ = acc6;
+        *pDst++ = acc7;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining output samples */
+    blkCnt = blockSize & 0x7U;
+
+#else
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* Copy one sample at a time into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0.0f;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize Coefficient pointer */
+        pb = pCoeffs;
+
+        i = numTaps;
+        /* Perform the multiply-accumulates */
+        while (i > 0U)
+        {
+            /* acc =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0] */
+            acc0 += *px++ * *pb++;
+
+            i--;
+        }
+
+        /* Store result in destination buffer. */
+        *pDst++ = acc0;
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 taps at a time */
+    tapCnt = (numTaps - 1U) >> 2U;
+
+    /* Copy data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+
+    /* Calculate remaining number of copies */
+    tapCnt = (numTaps - 1U) & 0x3U;
+
+#else
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+#endif /* defined (RISCV_MATH_VECTOR) */
+}
+
+#define TEST_LENGTH_SAMPLES_F64 1024
+#define NUM_TAPS_F64 32 /* Must be even */
+
+static float64_t testInput_f64_50Hz_200Hz[TEST_LENGTH_SAMPLES_F64] = {};
+
+static float64_t firCoeffs64LP[NUM_TAPS_F64] = {};
+
+static void generate_rand_f64(float64_t *src, int length)
+{
+    do_srand();
+    for (int i = 0; i < length; i++)
+    {
+        src[i] = (float64_t)((rand() % Q31_MAX - Q31_MAX / 2) * 1.0 / Q31_MAX);
+    }
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_init_f64(
+    riscv_fir_instance_f64 *S,
+    uint16_t numTaps,
+    const float64_t *pCoeffs,
+    float64_t *pState,
+    uint32_t blockSize)
+{
+    /* Assign filter taps */
+    S->numTaps = numTaps;
+
+    /* Assign coefficient pointer */
+    S->pCoeffs = pCoeffs;
+
+    /* Clear state buffer. The size is always (blockSize + numTaps - 1) */
+    memset(pState, 0, (numTaps + (blockSize - 1U)) * sizeof(float64_t));
+    /* Assign state pointer */
+    S->pState = pState;
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_f64(
+    const riscv_fir_instance_f64 *S,
+    const float64_t *pSrc,
+    float64_t *pDst,
+    uint32_t blockSize)
+{
+    float64_t *pState = S->pState;         /* State pointer */
+    const float64_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    float64_t *pStateCurnt;                /* Points to the current sample of the state */
+    float64_t *px;                         /* Temporary pointer for state buffer */
+    const float64_t *pb;                   /* Temporary pointer for coefficient buffer */
+    float64_t acc0;                        /* Accumulator */
+    uint32_t numTaps = S->numTaps;         /* Number of filter coefficients in the filter */
+    uint32_t i, tapCnt, blkCnt;            /* Loop counters */
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy one sample at a time into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0.;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize Coefficient pointer */
+        pb = pCoeffs;
+
+        i = numTaps;
+
+        /* Perform the multiply-accumulates */
+        while (i > 0U)
+        {
+            /* acc =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0] */
+            acc0 += *px++ * *pb++;
+
+            i--;
+        }
+
+        /* Store result in destination buffer. */
+        *pDst++ = acc0;
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+     Now copy the last numTaps - 1 samples to the start of the state buffer.
+     This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+}
+
+#define TEST_LENGTH_SAMPLES_Q7 1024
+#define NUM_TAPS_Q7 32 /* Must be even */
+
+static q7_t testInput_q7_50Hz_200Hz[TEST_LENGTH_SAMPLES_Q7] = {};
+
+static q7_t firCoeffLP_q7[NUM_TAPS_Q7] = {};
+
+RISCV_DSP_ATTRIBUTE void riscv_float_to_q7(
+    const float32_t *pSrc,
+    q7_t *pDst,
+    uint32_t blockSize)
+{
+    uint32_t blkCnt;             /* Loop counter */
+    const float32_t *pIn = pSrc; /* Source pointer */
+
+#if defined(RISCV_MATH_VECTOR)
+    blkCnt = blockSize; /* Loop counter */
+    size_t l;
+    vfloat32m8_t v_in;
+    vint8m2_t v_out;
+    for (; (l = __riscv_vsetvl_e32m8(blkCnt)) > 0; blkCnt -= l)
+    {
+        v_in = __riscv_vle32_v_f32m8(pIn, l);
+        pIn += l;
+#ifdef RISCV_MATH_ROUNDING
+        v_out = __riscv_vnclip_wx_i8m2(__riscv_vnclip_wx_i16m4(__riscv_vfcvt_x_f_v_i32m8(__riscv_vfmul_vf_f32m8(v_in, 128.0f, l), l), 0U, __RISCV_VXRM_RNU, l), 0U, __RISCV_VXRM_RNU, l);
+#else
+        v_out = __riscv_vnclip_wx_i8m2(__riscv_vnclip_wx_i16m4(__riscv_vfcvt_rtz_x_f_v_i32m8(__riscv_vfmul_vf_f32m8(v_in, 128.0f, l), l), 0U, __RISCV_VXRM_RNU, l), 0U, __RISCV_VXRM_RNU, l);
+#endif
+        __riscv_vse8_v_i8m2(pDst, v_out, l);
+        pDst += l;
+    }
+#else
+
+#ifdef RISCV_MATH_ROUNDING
+    float32_t in;
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 outputs at a time */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* C = A * 128 */
+
+        /* Convert from float to q7 and store result in destination buffer */
+#ifdef RISCV_MATH_ROUNDING
+
+        in = (*pIn++ * 128);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q7_t)(__SSAT((q15_t)(in), 8));
+
+        in = (*pIn++ * 128);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q7_t)(__SSAT((q15_t)(in), 8));
+
+        in = (*pIn++ * 128);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q7_t)(__SSAT((q15_t)(in), 8));
+
+        in = (*pIn++ * 128);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q7_t)(__SSAT((q15_t)(in), 8));
+
+#else
+
+        *pDst++ = __SSAT((q31_t)(*pIn++ * 128.0f), 8);
+        *pDst++ = __SSAT((q31_t)(*pIn++ * 128.0f), 8);
+        *pDst++ = __SSAT((q31_t)(*pIn++ * 128.0f), 8);
+        *pDst++ = __SSAT((q31_t)(*pIn++ * 128.0f), 8);
+
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining outputs */
+    blkCnt = blockSize & 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of samples */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* C = A * 128 */
+
+        /* Convert from float to q7 and store result in destination buffer */
+#ifdef RISCV_MATH_ROUNDING
+
+        in = (*pIn++ * 128);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q7_t)(__SSAT((q15_t)(in), 8));
+
+#else
+
+        *pDst++ = (q7_t)__SSAT((q31_t)(*pIn++ * 128.0f), 8);
+
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+#endif /* defined(RISCV_MATH_VECTOR) */
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_init_q7(
+    riscv_fir_instance_q7 *S,
+    uint16_t numTaps,
+    const q7_t *pCoeffs,
+    q7_t *pState,
+    uint32_t blockSize)
+{
+    /* Assign filter taps */
+    S->numTaps = numTaps;
+
+    /* Assign coefficient pointer */
+    S->pCoeffs = pCoeffs;
+
+    /* Clear state buffer. The size is always (blockSize + numTaps - 1) */
+    memset(pState, 0, (numTaps + (blockSize - 1U)) * sizeof(q7_t));
+
+    /* Assign state pointer */
+    S->pState = pState;
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_q7(
+    const riscv_fir_instance_q7 *S,
+    const q7_t *pSrc,
+    q7_t *pDst,
+    uint32_t blockSize)
+{
+    q7_t *pState = S->pState;         /* State pointer */
+    const q7_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    q7_t *pStateCurnt;                /* Points to the current sample of the state */
+    q7_t *px;                         /* Temporary pointer for state buffer */
+    const q7_t *pb;                   /* Temporary pointer for coefficient buffer */
+    q31_t acc0;                       /* Accumulators */
+    uint32_t numTaps = S->numTaps;    /* Number of filter coefficients in the filter */
+    uint32_t i, tapCnt, blkCnt;       /* Loop counters */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+    q31_t acc1, acc2, acc3;  /* Accumulators */
+    q7_t x0, x1, x2, x3, c0; /* Temporary variables to hold state */
+#endif
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+#if defined(RISCV_MATH_VECTOR)
+    uint32_t j;
+    size_t l;
+    vint8m2_t vx;
+    vint32m8_t vres0m8;
+    q7_t *pOut = pDst;
+    /* Copy samples into state buffer */
+    riscv_copy_q7(pSrc, pStateCurnt, blockSize);
+    for (i = blockSize; i > 0; i -= l)
+    {
+        l = __riscv_vsetvl_e8m2(i);
+        vx = __riscv_vle8_v_i8m2(pState, l);
+        pState += l;
+        vres0m8 = __riscv_vmv_v_x_i32m8(0, l);
+        for (j = 0; j < numTaps; j++)
+        {
+            vres0m8 = __riscv_vwmacc_vx_i32m8(vres0m8, *(pCoeffs + j), __riscv_vwadd_vx_i16m4(vx, 0, l), l);
+            vx = __riscv_vslide1down_vx_i8m2(vx, *(pState + j), l);
+        }
+        __riscv_vse8_v_i8m2(pOut, __riscv_vnclip_wx_i8m2(__riscv_vnsra_wx_i16m4(vres0m8, 7, l), 0, __RISCV_VXRM_RNU, l), l);
+        pOut += l;
+    }
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+    /* Copy data */
+    riscv_copy_q7(pState, pStateCurnt, numTaps - 1);
+#else
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 output values simultaneously.
+     * The variables acc0 ... acc3 hold output values that are being computed:
+     *
+     *    acc0 =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0]
+     *    acc1 =  b[numTaps-1] * x[n-numTaps]   + b[numTaps-2] * x[n-numTaps-1] + b[numTaps-3] * x[n-numTaps-2] +...+ b[0] * x[1]
+     *    acc2 =  b[numTaps-1] * x[n-numTaps+1] + b[numTaps-2] * x[n-numTaps]   + b[numTaps-3] * x[n-numTaps-1] +...+ b[0] * x[2]
+     *    acc3 =  b[numTaps-1] * x[n-numTaps+2] + b[numTaps-2] * x[n-numTaps+1] + b[numTaps-3] * x[n-numTaps]   +...+ b[0] * x[3]
+     */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy 4 new input samples into the state buffer. */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set all accumulators to zero */
+        acc0 = 0;
+        acc1 = 0;
+        acc2 = 0;
+        acc3 = 0;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize coefficient pointer */
+        pb = pCoeffs;
+
+        /* Read the first 3 samples from the state buffer:
+         *  x[n-numTaps], x[n-numTaps-1], x[n-numTaps-2] */
+        x0 = *px++;
+        x1 = *px++;
+        x2 = *px++;
+
+        /* Loop unrolling. Process 4 taps at a time. */
+        tapCnt = numTaps >> 2U;
+
+        /* Loop over the number of taps.  Unroll by a factor of 4.
+           Repeat until we've computed numTaps-4 coefficients. */
+        while (tapCnt > 0U)
+        {
+            /* Read the b[numTaps] coefficient */
+            c0 = *pb;
+
+            /* Read x[n-numTaps-3] sample */
+            x3 = *px;
+
+            /* acc0 +=  b[numTaps] * x[n-numTaps] */
+            acc0 += ((q15_t)x0 * c0);
+
+            /* acc1 +=  b[numTaps] * x[n-numTaps-1] */
+            acc1 += ((q15_t)x1 * c0);
+
+            /* acc2 +=  b[numTaps] * x[n-numTaps-2] */
+            acc2 += ((q15_t)x2 * c0);
+
+            /* acc3 +=  b[numTaps] * x[n-numTaps-3] */
+            acc3 += ((q15_t)x3 * c0);
+
+            /* Read the b[numTaps-1] coefficient */
+            c0 = *(pb + 1U);
+
+            /* Read x[n-numTaps-4] sample */
+            x0 = *(px + 1U);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q15_t)x1 * c0);
+            acc1 += ((q15_t)x2 * c0);
+            acc2 += ((q15_t)x3 * c0);
+            acc3 += ((q15_t)x0 * c0);
+
+            /* Read the b[numTaps-2] coefficient */
+            c0 = *(pb + 2U);
+
+            /* Read x[n-numTaps-5] sample */
+            x1 = *(px + 2U);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q15_t)x2 * c0);
+            acc1 += ((q15_t)x3 * c0);
+            acc2 += ((q15_t)x0 * c0);
+            acc3 += ((q15_t)x1 * c0);
+
+            /* Read the b[numTaps-3] coefficients */
+            c0 = *(pb + 3U);
+
+            /* Read x[n-numTaps-6] sample */
+            x2 = *(px + 3U);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q15_t)x3 * c0);
+            acc1 += ((q15_t)x0 * c0);
+            acc2 += ((q15_t)x1 * c0);
+            acc3 += ((q15_t)x2 * c0);
+
+            /* update coefficient pointer */
+            pb += 4U;
+            px += 4U;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* If the filter length is not a multiple of 4, compute the remaining filter taps */
+        tapCnt = numTaps & 0x3U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read coefficients */
+            c0 = *(pb++);
+
+            /* Fetch 1 state variable */
+            x3 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q15_t)x0 * c0);
+            acc1 += ((q15_t)x1 * c0);
+            acc2 += ((q15_t)x2 * c0);
+            acc3 += ((q15_t)x3 * c0);
+
+            /* Reuse the present sample states for next sample */
+            x0 = x1;
+            x1 = x2;
+            x2 = x3;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* The results in the 4 accumulators are in 2.62 format. Convert to 1.31
+           Then store the 4 outputs in the destination buffer. */
+        acc0 = __SSAT((acc0 >> 7U), 8);
+        *pDst++ = acc0;
+        acc1 = __SSAT((acc1 >> 7U), 8);
+        *pDst++ = acc1;
+        acc2 = __SSAT((acc2 >> 7U), 8);
+        *pDst++ = acc2;
+        acc3 = __SSAT((acc3 >> 7U), 8);
+        *pDst++ = acc3;
+
+        /* Advance the state pointer by 4 to process the next group of 4 samples */
+        pState = pState + 4U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining output samples */
+    blkCnt = blockSize & 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* Copy one sample at a time into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize Coefficient pointer */
+        pb = pCoeffs;
+
+        i = numTaps;
+        /* Perform the multiply-accumulates */
+        while (i > 0U)
+        {
+            acc0 += (q15_t) * (px++) * (*(pb++));
+            i--;
+        }
+
+        /* The result is in 2.14 format. Convert to 1.7
+           Then store the output in the destination buffer. */
+        *pDst++ = __SSAT((acc0 >> 7U), 8);
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 taps at a time */
+    tapCnt = (numTaps - 1U) >> 2U;
+
+    /* Copy data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+
+    /* Calculate remaining number of copies */
+    tapCnt = (numTaps - 1U) & 0x3U;
+
+#else
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement the loop counter */
+        tapCnt--;
+    }
+#endif /* defined (RISCV_MATH_VECTOR) */
+}
+
+#define TEST_LENGTH_SAMPLES_Q15 1024
+#define NUM_TAPS_Q15 32 /* Must be even */
+
+static q15_t testInput_q15_50Hz_200Hz[TEST_LENGTH_SAMPLES_Q15] = {};
+
+static q15_t firCoeffLP_q15[NUM_TAPS_Q15] = {};
+
+RISCV_DSP_ATTRIBUTE void riscv_float_to_q15(
+    const float32_t *pSrc,
+    q15_t *pDst,
+    uint32_t blockSize)
+{
+    uint32_t blkCnt;             /* Loop counter */
+    const float32_t *pIn = pSrc; /* Source pointer */
+
+#if defined(RISCV_MATH_VECTOR)
+    blkCnt = blockSize; /* Loop counter */
+    size_t l;
+    vfloat32m8_t v_in;
+    vint16m4_t v_out;
+    for (; (l = __riscv_vsetvl_e32m8(blkCnt)) > 0; blkCnt -= l)
+    {
+        v_in = __riscv_vle32_v_f32m8(pIn, l);
+        pIn += l;
+#ifdef RISCV_MATH_ROUNDING
+        v_out = __riscv_vnclip_wx_i16m4(__riscv_vfcvt_x_f_v_i32m8(__riscv_vfmul_vf_f32m8(v_in, 32768.0f, l), l), 0, __RISCV_VXRM_RNU, l);
+#else
+        v_out = __riscv_vnclip_wx_i16m4(__riscv_vfcvt_rtz_x_f_v_i32m8(__riscv_vfmul_vf_f32m8(v_in, 32768.0f, l), l), 0, __RISCV_VXRM_RNU, l);
+#endif
+        __riscv_vse16_v_i16m4(pDst, v_out, l);
+        pDst += l;
+    }
+#else
+
+#ifdef RISCV_MATH_ROUNDING
+    float32_t in;
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 outputs at a time */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* C = A * 32768 */
+
+        /* convert from float to Q15 and store result in destination buffer */
+#ifdef RISCV_MATH_ROUNDING
+
+        in = (*pIn++ * 32768.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q15_t)(__SSAT((q31_t)(in), 16));
+
+        in = (*pIn++ * 32768.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q15_t)(__SSAT((q31_t)(in), 16));
+
+        in = (*pIn++ * 32768.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q15_t)(__SSAT((q31_t)(in), 16));
+
+        in = (*pIn++ * 32768.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q15_t)(__SSAT((q31_t)(in), 16));
+
+#else
+
+        *pDst++ = (q15_t)__SSAT((q31_t)(*pIn++ * 32768.0f), 16);
+        *pDst++ = (q15_t)__SSAT((q31_t)(*pIn++ * 32768.0f), 16);
+        *pDst++ = (q15_t)__SSAT((q31_t)(*pIn++ * 32768.0f), 16);
+        *pDst++ = (q15_t)__SSAT((q31_t)(*pIn++ * 32768.0f), 16);
+
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining outputs */
+    blkCnt = blockSize & 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of samples */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* C = A * 32768 */
+
+        /* convert from float to Q15 and store result in destination buffer */
+#ifdef RISCV_MATH_ROUNDING
+
+        in = (*pIn++ * 32768.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = (q15_t)(__SSAT((q31_t)(in), 16));
+
+#else
+
+        /* C = A * 32768 */
+        /* Convert from float to q15 and then store the results in the destination buffer */
+        *pDst++ = (q15_t)__SSAT((q31_t)(*pIn++ * 32768.0f), 16);
+
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+#endif /* defined(RISCV_MATH_VECTOR) */
+}
+
+RISCV_DSP_ATTRIBUTE riscv_status riscv_fir_init_q15(
+    riscv_fir_instance_q15 *S,
+    uint16_t numTaps,
+    const q15_t *pCoeffs,
+    q15_t *pState,
+    uint32_t blockSize)
+{
+    riscv_status status;
+
+    /* Assign filter taps */
+    S->numTaps = numTaps;
+
+    /* Assign coefficient pointer */
+    S->pCoeffs = pCoeffs;
+
+    /* Clear state buffer. The size is always (blockSize + numTaps - 1) */
+    memset(pState, 0, (numTaps + (blockSize - 1U)) * sizeof(q15_t));
+
+    /* Assign state pointer */
+    S->pState = pState;
+
+    status = RISCV_MATH_SUCCESS;
+
+    return (status);
+}
+
+__STATIC_FORCEINLINE q31_t clip_q63_to_q31(
+    q63_t x)
+{
+    return ((q31_t)(x >> 32) != ((q31_t)x >> 31)) ? ((0x7FFFFFFF ^ ((q31_t)(x >> 63)))) : (q31_t)x;
+}
+
+/**
+ * @brief Clips Q63 to Q15 values.
+ */
+__STATIC_FORCEINLINE q15_t clip_q63_to_q15(
+    q63_t x)
+{
+    return ((q31_t)(x >> 32) != ((q31_t)x >> 31)) ? ((0x7FFF ^ ((q15_t)(x >> 63)))) : (q15_t)(x >> 15);
+}
+
+/**
+ * @brief Clips Q31 to Q7 values.
+ */
+__STATIC_FORCEINLINE q7_t clip_q31_to_q7(
+    q31_t x)
+{
+    return ((q31_t)(x >> 24) != ((q31_t)x >> 23)) ? ((0x7F ^ ((q7_t)(x >> 31)))) : (q7_t)x;
+}
+
+/**
+ * @brief Clips Q31 to Q15 values.
+ */
+__STATIC_FORCEINLINE q15_t clip_q31_to_q15(
+    q31_t x)
+{
+    return ((q31_t)(x >> 16) != ((q31_t)x >> 15)) ? ((0x7FFF ^ ((q15_t)(x >> 31)))) : (q15_t)x;
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_q15(
+    const riscv_fir_instance_q15 *S,
+    const q15_t *pSrc,
+    q15_t *pDst,
+    uint32_t blockSize)
+{
+    q15_t *pState = S->pState;         /* State pointer */
+    const q15_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    q15_t *pStateCurnt;                /* Points to the current sample of the state */
+    q15_t *px;                         /* Temporary pointer for state buffer */
+    const q15_t *pb;                   /* Temporary pointer for coefficient buffer */
+    q63_t acc0;                        /* Accumulators */
+    uint32_t numTaps = S->numTaps;     /* Number of filter coefficients in the filter */
+    uint32_t tapCnt, blkCnt;           /* Loop counters */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+    q63_t acc1, acc2, acc3; /* Accumulators */
+    q31_t x0, x1, x2, c0;   /* Temporary variables to hold state and coefficient values */
+#endif
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+#if defined(RISCV_MATH_VECTOR) && (__RISCV_XLEN == 64)
+    uint32_t i, j;
+    size_t l;
+    vint16m2_t vx;
+    vint64m8_t vres0m8;
+    q15_t *pOut = pDst;
+    /* Copy samples into state buffer */
+    riscv_copy_q15(pSrc, pStateCurnt, blockSize);
+    for (i = blockSize; i > 0; i -= l)
+    {
+        l = __riscv_vsetvl_e16m2(i);
+        vx = __riscv_vle16_v_i16m2(pState, l);
+        pState += l;
+        vres0m8 = __riscv_vmv_v_x_i64m8(0, l);
+        for (j = 0; j < numTaps; j++)
+        {
+            vres0m8 = __riscv_vwmacc_vx_i64m8(vres0m8, *(pCoeffs + j), __riscv_vwadd_vx_i32m4(vx, 0, l), l);
+            vx = __riscv_vslide1down_vx_i16m2(vx, *(pState + j), l);
+        }
+        __riscv_vse16_v_i16m2(pOut, __riscv_vnclip_wx_i16m2(__riscv_vnsra_wx_i32m4(vres0m8, 15, l), 0, __RISCV_VXRM_RNU, l), l);
+        pOut += l;
+    }
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+    /* Copy data */
+    riscv_copy_q15(pState, pStateCurnt, numTaps - 1);
+#else
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 output values simultaneously.
+     * The variables acc0 ... acc3 hold output values that are being computed:
+     *
+     *    acc0 =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0]
+     *    acc1 =  b[numTaps-1] * x[n-numTaps]   + b[numTaps-2] * x[n-numTaps-1] + b[numTaps-3] * x[n-numTaps-2] +...+ b[0] * x[1]
+     *    acc2 =  b[numTaps-1] * x[n-numTaps+1] + b[numTaps-2] * x[n-numTaps]   + b[numTaps-3] * x[n-numTaps-1] +...+ b[0] * x[2]
+     *    acc3 =  b[numTaps-1] * x[n-numTaps+2] + b[numTaps-2] * x[n-numTaps+1] + b[numTaps-3] * x[n-numTaps]   +...+ b[0] * x[3]
+     */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy 4 new input samples into the state buffer. */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set all accumulators to zero */
+        acc0 = 0;
+        acc1 = 0;
+        acc2 = 0;
+        acc3 = 0;
+
+        /* Typecast q15_t pointer to q31_t pointer for state reading in q31_t */
+        px = pState;
+
+        /* Typecast q15_t pointer to q31_t pointer for coefficient reading in q31_t */
+        pb = pCoeffs;
+
+        /* Read the first two samples from the state buffer:  x[n-N], x[n-N-1] */
+        x0 = read_q15x2_ia(&px);
+
+        /* Read the third and forth samples from the state buffer: x[n-N-2], x[n-N-3] */
+        x2 = read_q15x2_ia(&px);
+
+        /* Loop over the number of taps.  Unroll by a factor of 4.
+           Repeat until we've computed numTaps-(numTaps%4) coefficients. */
+        tapCnt = numTaps >> 2U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read the first two coefficients using SIMD:  b[N] and b[N-1] coefficients */
+            c0 = read_q15x2_ia((q15_t **)&pb);
+
+            /* acc0 +=  b[N] * x[n-N] + b[N-1] * x[n-N-1] */
+            acc0 = __SMLALD(x0, c0, acc0);
+
+            /* acc2 +=  b[N] * x[n-N-2] + b[N-1] * x[n-N-3] */
+            acc2 = __SMLALD(x2, c0, acc2);
+
+            /* pack  x[n-N-1] and x[n-N-2] */
+            x1 = __PKHBT(x2, x0, 0);
+
+            /* Read state x[n-N-4], x[n-N-5] */
+            x0 = read_q15x2_ia((q15_t **)&px);
+
+            /* acc1 +=  b[N] * x[n-N-1] + b[N-1] * x[n-N-2] */
+            acc1 = __SMLALDX(x1, c0, acc1);
+
+            /* pack  x[n-N-3] and x[n-N-4] */
+            x1 = __PKHBT(x0, x2, 0);
+
+            /* acc3 +=  b[N] * x[n-N-3] + b[N-1] * x[n-N-4] */
+            acc3 = __SMLALDX(x1, c0, acc3);
+
+            /* Read coefficients b[N-2], b[N-3] */
+            c0 = read_q15x2_ia((q15_t **)&pb);
+
+            /* acc0 +=  b[N-2] * x[n-N-2] + b[N-3] * x[n-N-3] */
+            acc0 = __SMLALD(x2, c0, acc0);
+
+            /* Read state x[n-N-6], x[n-N-7] with offset */
+            x2 = read_q15x2_ia((q15_t **)&px);
+
+            /* acc2 +=  b[N-2] * x[n-N-4] + b[N-3] * x[n-N-5] */
+            acc2 = __SMLALD(x0, c0, acc2);
+
+            /* acc1 +=  b[N-2] * x[n-N-3] + b[N-3] * x[n-N-4] */
+            acc1 = __SMLALDX(x1, c0, acc1);
+
+            /* pack  x[n-N-5] and x[n-N-6] */
+            x1 = __PKHBT(x2, x0, 0);
+
+            /* acc3 +=  b[N-2] * x[n-N-5] + b[N-3] * x[n-N-6] */
+            acc3 = __SMLALDX(x1, c0, acc3);
+
+            /* Decrement tap count */
+            tapCnt--;
+        }
+
+        /* If the filter length is not a multiple of 4, compute the remaining filter taps.
+           This is always be 2 taps since the filter length is even. */
+        if ((numTaps & 0x3U) != 0U)
+        {
+            /* Read last two coefficients */
+            c0 = read_q15x2_ia((q15_t **)&pb);
+
+            /* Perform the multiply-accumulates */
+            acc0 = __SMLALD(x0, c0, acc0);
+            acc2 = __SMLALD(x2, c0, acc2);
+
+            /* pack state variables */
+            x1 = __PKHBT(x2, x0, 0);
+
+            /* Read last state variables */
+            x0 = read_q15x2((q15_t *)px);
+
+            /* Perform the multiply-accumulates */
+            acc1 = __SMLALDX(x1, c0, acc1);
+
+            /* pack state variables */
+            x1 = __PKHBT(x0, x2, 0);
+
+            /* Perform the multiply-accumulates */
+            acc3 = __SMLALDX(x1, c0, acc3);
+        }
+
+        /* The results in the 4 accumulators are in 2.30 format. Convert to 1.15 with saturation.
+           Then store the 4 outputs in the destination buffer. */
+#if defined(RISCV_MATH_DSP) && (__RISCV_XLEN == 64)
+        write_q15x4_ia(&pDst, __RV_PKBB32(__PKHBT(__SSAT((acc2 >> 15), 16), __SSAT((acc3 >> 15), 16), 16), __PKHBT(__SSAT((acc0 >> 15), 16), __SSAT((acc1 >> 15), 16), 16)));
+#else
+        write_q15x2_ia(&pDst, __PKHBT(__SSAT((acc0 >> 15), 16), __SSAT((acc1 >> 15), 16), 16));
+        write_q15x2_ia(&pDst, __PKHBT(__SSAT((acc2 >> 15), 16), __SSAT((acc3 >> 15), 16), 16));
+#endif /* (RISCV_MATH_DSP) && (__RISCV_XLEN == 64) */
+
+        /* Advance the state pointer by 4 to process the next group of 4 samples */
+        pState = pState + 4U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining output samples */
+    blkCnt = blockSize & 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* Copy two samples into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0;
+
+        /* Use SIMD to hold states and coefficients */
+        px = pState;
+        pb = pCoeffs;
+        tapCnt = numTaps >> 1U;
+
+        while (tapCnt > 0U)
+        {
+            acc0 += (q31_t)*px++ * *pb++;
+            acc0 += (q31_t)*px++ * *pb++;
+
+            tapCnt--;
+        }
+
+        /* The result is in 2.30 format. Convert to 1.15 with saturation.
+           Then store the output in the destination buffer. */
+        *pDst++ = (q15_t)(__SSAT((acc0 >> 15), 16));
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 taps at a time */
+    tapCnt = (numTaps - 1U) >> 2U;
+
+    /* Copy data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+
+    /* Calculate remaining number of copies */
+    tapCnt = (numTaps - 1U) & 0x3U;
+
+#else
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+#endif /* defined (RISCV_MATH_VECTOR) && (__RISCV_XLEN == 64) */
+}
+
+#define TEST_LENGTH_SAMPLES_Q31 1024
+#define NUM_TAPS_Q31 32 /* Must be even */
+
+static q31_t testInput_q31_50Hz_200Hz[TEST_LENGTH_SAMPLES_Q31] = {};
+
+static q31_t firCoeffLP_q31[NUM_TAPS_Q31] = {};
+
+RISCV_DSP_ATTRIBUTE void riscv_float_to_q31(
+    const float32_t *pSrc,
+    q31_t *pDst,
+    uint32_t blockSize)
+{
+    uint32_t blkCnt;             /* Loop counter */
+    const float32_t *pIn = pSrc; /* Source pointer */
+
+#if defined(RISCV_MATH_VECTOR)
+    blkCnt = blockSize; /* Loop counter */
+    size_t l;
+    vfloat32m4_t v_in;
+    vint32m4_t v_out;
+    for (; (l = __riscv_vsetvl_e32m4(blkCnt)) > 0; blkCnt -= l)
+    {
+        v_in = __riscv_vle32_v_f32m4(pIn, l);
+        pIn += l;
+#ifdef RISCV_MATH_ROUNDING
+        v_out = __riscv_vfcvt_x_f_v_i32m4(__riscv_vfmul_vf_f32m4(v_in, 2147483648.0f, l), l);
+#else
+        v_out = __riscv_vfcvt_rtz_x_f_v_i32m4(__riscv_vfmul_vf_f32m4(v_in, 2147483648.0f, l), l);
+#endif
+        __riscv_vse32_v_i32m4(pDst, v_out, l);
+        pDst += l;
+    }
+#else
+#ifdef RISCV_MATH_ROUNDING
+    float32_t in;
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 outputs at a time */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* C = A * 2147483648 */
+
+        /* convert from float to Q31 and store result in destination buffer */
+#ifdef RISCV_MATH_ROUNDING
+
+        in = (*pIn++ * 2147483648.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = clip_q63_to_q31((q63_t)(in));
+
+        in = (*pIn++ * 2147483648.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = clip_q63_to_q31((q63_t)(in));
+
+        in = (*pIn++ * 2147483648.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = clip_q63_to_q31((q63_t)(in));
+
+        in = (*pIn++ * 2147483648.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = clip_q63_to_q31((q63_t)(in));
+
+#else
+
+        /* C = A * 2147483648 */
+        /* Convert from float to Q31 and then store the results in the destination buffer */
+        *pDst++ = clip_q63_to_q31((q63_t)(*pIn++ * 2147483648.0f));
+        *pDst++ = clip_q63_to_q31((q63_t)(*pIn++ * 2147483648.0f));
+        *pDst++ = clip_q63_to_q31((q63_t)(*pIn++ * 2147483648.0f));
+        *pDst++ = clip_q63_to_q31((q63_t)(*pIn++ * 2147483648.0f));
+
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining outputs */
+    blkCnt = blockSize & 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of samples */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* C = A * 2147483648 */
+
+        /* convert from float to Q31 and store result in destination buffer */
+#ifdef RISCV_MATH_ROUNDING
+
+        in = (*pIn++ * 2147483648.0f);
+        in += in > 0.0f ? 0.5f : -0.5f;
+        *pDst++ = clip_q63_to_q31((q63_t)(in));
+
+#else
+
+        /* C = A * 2147483648 */
+        /* Convert from float to Q31 and then store the results in the destination buffer */
+        *pDst++ = clip_q63_to_q31((q63_t)(*pIn++ * 2147483648.0f));
+
+#endif /* #ifdef RISCV_MATH_ROUNDING */
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+#endif /* defined(RISCV_MATH_VECTOR) */
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_init_q31(
+    riscv_fir_instance_q31 *S,
+    uint16_t numTaps,
+    const q31_t *pCoeffs,
+    q31_t *pState,
+    uint32_t blockSize)
+{
+    /* Assign filter taps */
+    S->numTaps = numTaps;
+
+    /* Assign coefficient pointer */
+    S->pCoeffs = pCoeffs;
+
+    /* Clear state buffer. The size is always (blockSize + numTaps - 1) */
+    memset(pState, 0, (numTaps + (blockSize - 1U)) * sizeof(q31_t));
+
+    /* Assign state pointer */
+    S->pState = pState;
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_q31(
+    const riscv_fir_instance_q31 *S,
+    const q31_t *pSrc,
+    q31_t *pDst,
+    uint32_t blockSize)
+{
+    q31_t *pState = S->pState;         /* State pointer */
+    const q31_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    q31_t *pStateCurnt;                /* Points to the current sample of the state */
+    q31_t *px;                         /* Temporary pointer for state buffer */
+    const q31_t *pb;                   /* Temporary pointer for coefficient buffer */
+    q63_t acc0;                        /* Accumulator */
+    uint32_t numTaps = S->numTaps;     /* Number of filter coefficients in the filter */
+    uint32_t i, tapCnt, blkCnt;        /* Loop counters */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+    q63_t acc1, acc2; /* Accumulators */
+    q31_t x0, x1, x2; /* Temporary variables to hold state values */
+    q31_t c0;         /* Temporary variable to hold coefficient value */
+#endif
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+#if defined(RISCV_MATH_VECTOR) && (__RISCV_XLEN == 64)
+    uint32_t j;
+    size_t l;
+    vint32m4_t vx;
+    vint64m8_t vres0m8;
+    q31_t *pOut = pDst;
+    /* Copy samples into state buffer */
+    riscv_copy_q31(pSrc, pStateCurnt, blockSize);
+    for (i = blockSize; i > 0; i -= l)
+    {
+        l = __riscv_vsetvl_e32m4(i);
+        vx = __riscv_vle32_v_i32m4(pState, l);
+        pState += l;
+        vres0m8 = __riscv_vmv_v_x_i64m8(0, l);
+        for (j = 0; j < numTaps; j++)
+        {
+            vres0m8 = __riscv_vwmacc_vx_i64m8(vres0m8, *(pCoeffs + j), vx, l);
+            vx = __riscv_vslide1down_vx_i32m4(vx, *(pState + j), l);
+        }
+        __riscv_vse32_v_i32m4(pOut, __riscv_vnsra_wx_i32m4(vres0m8, 31, l), l);
+        pOut += l;
+    }
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+    /* Copy data */
+    riscv_copy_q31(pState, pStateCurnt, numTaps - 1);
+#else
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 output values simultaneously.
+     * The variables acc0 ... acc3 hold output values that are being computed:
+     *
+     *    acc0 =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0]
+     *    acc1 =  b[numTaps-1] * x[n-numTaps]   + b[numTaps-2] * x[n-numTaps-1] + b[numTaps-3] * x[n-numTaps-2] +...+ b[0] * x[1]
+     *    acc2 =  b[numTaps-1] * x[n-numTaps+1] + b[numTaps-2] * x[n-numTaps]   + b[numTaps-3] * x[n-numTaps-1] +...+ b[0] * x[2]
+     *    acc3 =  b[numTaps-1] * x[n-numTaps+2] + b[numTaps-2] * x[n-numTaps+1] + b[numTaps-3] * x[n-numTaps]   +...+ b[0] * x[3]
+     */
+
+    blkCnt = blockSize / 3;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy 3 new input samples into the state buffer. */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set all accumulators to zero */
+        acc0 = 0;
+        acc1 = 0;
+        acc2 = 0;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize coefficient pointer */
+        pb = pCoeffs;
+
+        /* Read the first 2 samples from the state buffer: x[n-numTaps], x[n-numTaps-1] */
+        x0 = *px++;
+        x1 = *px++;
+
+        /* Loop unrolling: process 3 taps at a time. */
+        tapCnt = numTaps / 3;
+
+        while (tapCnt > 0U)
+        {
+#if defined(RISCV_MATH_DSP) && (__RISCV_XLEN == 64)
+            q63_t c064 = read_q31x2_ia((q31_t **)&pb);
+            x2 = *(px++);
+
+            acc0 = __RV_KMADA32(acc0, __RV_PKBB32(x1, x0), c064);
+            acc1 = __RV_KMADA32(acc1, __RV_PKBB32(x2, x1), c064);
+            x0 = *(px++);
+            acc2 = __RV_KMADA32(acc2, __RV_PKBB32(x0, x2), c064);
+            c0 = *(pb++);
+            x1 = *(px++);
+#else
+            /* Read the b[numTaps] coefficient */
+            c0 = *pb;
+
+            /* Read x[n-numTaps-2] sample */
+            x2 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q63_t)x0 * c0);
+            acc1 += ((q63_t)x1 * c0);
+            acc2 += ((q63_t)x2 * c0);
+
+            /* Read the coefficient and state */
+            c0 = *(pb + 1U);
+            x0 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q63_t)x1 * c0);
+            acc1 += ((q63_t)x2 * c0);
+            acc2 += ((q63_t)x0 * c0);
+
+            /* Read the coefficient and state */
+            c0 = *(pb + 2U);
+            x1 = *(px++);
+
+            /* update coefficient pointer */
+            pb += 3U;
+#endif /*  defined (RISCV_MATH_DSP) && (__RISCV_XLEN == 64) */
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q63_t)x2 * c0);
+            acc1 += ((q63_t)x0 * c0);
+            acc2 += ((q63_t)x1 * c0);
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* Loop unrolling: Compute remaining outputs */
+        tapCnt = numTaps % 0x3U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read coefficients */
+            c0 = *(pb++);
+
+            /* Fetch 1 state variable */
+            x2 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            acc0 += ((q63_t)x0 * c0);
+            acc1 += ((q63_t)x1 * c0);
+            acc2 += ((q63_t)x2 * c0);
+
+            /* Reuse the present sample states for next sample */
+            x0 = x1;
+            x1 = x2;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* Advance the state pointer by 3 to process the next group of 3 samples */
+        pState = pState + 3;
+
+        /* The result is in 2.30 format. Convert to 1.31 and store in destination buffer. */
+        *pDst++ = (q31_t)(acc0 >> 31U);
+        *pDst++ = (q31_t)(acc1 >> 31U);
+        *pDst++ = (q31_t)(acc2 >> 31U);
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining output samples */
+    blkCnt = blockSize % 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* Copy one sample at a time into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize Coefficient pointer */
+        pb = pCoeffs;
+
+        i = numTaps;
+
+        /* Perform the multiply-accumulates */
+        do
+        {
+            /* acc =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0] */
+            acc0 += (q63_t)*px++ * *pb++;
+
+            i--;
+        } while (i > 0U);
+
+        /* Result is in 2.62 format. Convert to 1.31 and store in destination buffer. */
+        *pDst++ = (q31_t)(acc0 >> 31U);
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 taps at a time */
+    tapCnt = (numTaps - 1U) >> 2U;
+
+    /* Copy data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+
+    /* Calculate remaining number of copies */
+    tapCnt = (numTaps - 1U) & 0x3U;
+
+#else
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+#endif /* defined (RISCV_MATH_VECTOR) && (__RISCV_XLEN == 64) */
+}
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_fast_q15(
+    const riscv_fir_instance_q15 *S,
+    const q15_t *pSrc,
+    q15_t *pDst,
+    uint32_t blockSize)
+{
+    q15_t *pState = S->pState;         /* State pointer */
+    const q15_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    q15_t *pStateCurnt;                /* Points to the current sample of the state */
+    q15_t *px;                         /* Temporary pointer for state buffer */
+    const q15_t *pb;                   /* Temporary pointer for coefficient buffer */
+    q31_t acc0;                        /* Accumulators */
+    uint32_t numTaps = S->numTaps;     /* Number of filter coefficients in the filter */
+    uint32_t tapCnt, blkCnt;           /* Loop counters */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+    q31_t acc1, acc2, acc3; /* Accumulators */
+    q31_t x0, x1, x2, c0;   /* Temporary variables to hold state and coefficient values */
+#endif
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+#if defined(RISCV_MATH_VECTOR)
+    uint32_t i, j;
+    size_t l;
+    vint16m4_t vx;
+    vint32m8_t vres0m8;
+    q15_t *pOut = pDst;
+    /* Copy samples into state buffer */
+    riscv_copy_q15(pSrc, pStateCurnt, blockSize);
+    for (i = blockSize; i > 0; i -= l)
+    {
+        l = __riscv_vsetvl_e16m4(i);
+        vx = __riscv_vle16_v_i16m4(pState, l);
+        pState += l;
+        vres0m8 = __riscv_vmv_v_x_i32m8(0, l);
+        for (j = 0; j < numTaps; j++)
+        {
+            vres0m8 = __riscv_vwmacc_vx_i32m8(vres0m8, *(pCoeffs + j), vx, l);
+            vx = __riscv_vslide1down_vx_i16m4(vx, *(pState + j), l);
+        }
+        __riscv_vse16_v_i16m4(pOut, __riscv_vnclip_wx_i16m4(__riscv_vsra_vx_i32m8(vres0m8, 15, l), 0, __RISCV_VXRM_RNU, l), l);
+        pOut += l;
+    }
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+    /* Copy data */
+    riscv_copy_q15(pState, pStateCurnt, numTaps - 1);
+#else
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 output values simultaneously.
+     * The variables acc0 ... acc3 hold output values that are being computed:
+     *
+     *    acc0 =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0]
+     *    acc1 =  b[numTaps-1] * x[n-numTaps]   + b[numTaps-2] * x[n-numTaps-1] + b[numTaps-3] * x[n-numTaps-2] +...+ b[0] * x[1]
+     *    acc2 =  b[numTaps-1] * x[n-numTaps+1] + b[numTaps-2] * x[n-numTaps]   + b[numTaps-3] * x[n-numTaps-1] +...+ b[0] * x[2]
+     *    acc3 =  b[numTaps-1] * x[n-numTaps+2] + b[numTaps-2] * x[n-numTaps+1] + b[numTaps-3] * x[n-numTaps]   +...+ b[0] * x[3]
+     */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy 4 new input samples into the state buffer. */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set all accumulators to zero */
+        acc0 = 0;
+        acc1 = 0;
+        acc2 = 0;
+        acc3 = 0;
+
+        /* Typecast q15_t pointer to q31_t pointer for state reading in q31_t */
+        px = pState;
+
+        /* Typecast q15_t pointer to q31_t pointer for coefficient reading in q31_t */
+        pb = pCoeffs;
+
+        /* Read the first two samples from the state buffer:  x[n-N], x[n-N-1] */
+        x0 = read_q15x2_ia(&px);
+
+        /* Read the third and forth samples from the state buffer: x[n-N-2], x[n-N-3] */
+        x2 = read_q15x2_ia(&px);
+
+        /* Loop over the number of taps.  Unroll by a factor of 4.
+           Repeat until we've computed numTaps-(numTaps%4) coefficients. */
+        tapCnt = numTaps >> 2U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read the first two coefficients using SIMD:  b[N] and b[N-1] coefficients */
+            c0 = read_q15x2_ia((q15_t **)&pb);
+
+            /* acc0 +=  b[N] * x[n-N] + b[N-1] * x[n-N-1] */
+            acc0 = __SMLAD(x0, c0, acc0);
+
+            /* acc2 +=  b[N] * x[n-N-2] + b[N-1] * x[n-N-3] */
+            acc2 = __SMLAD(x2, c0, acc2);
+
+            /* pack  x[n-N-1] and x[n-N-2] */
+            x1 = __PKHBT(x2, x0, 0);
+
+            /* Read state x[n-N-4], x[n-N-5] */
+            x0 = read_q15x2_ia(&px);
+
+            /* acc1 +=  b[N] * x[n-N-1] + b[N-1] * x[n-N-2] */
+            acc1 = __SMLADX(x1, c0, acc1);
+
+            /* pack  x[n-N-3] and x[n-N-4] */
+            x1 = __PKHBT(x0, x2, 0);
+
+            /* acc3 +=  b[N] * x[n-N-3] + b[N-1] * x[n-N-4] */
+            acc3 = __SMLADX(x1, c0, acc3);
+
+            /* Read coefficients b[N-2], b[N-3] */
+            c0 = read_q15x2_ia((q15_t **)&pb);
+
+            /* acc0 +=  b[N-2] * x[n-N-2] + b[N-3] * x[n-N-3] */
+            acc0 = __SMLAD(x2, c0, acc0);
+
+            /* Read state x[n-N-6], x[n-N-7] with offset */
+            x2 = read_q15x2_ia(&px);
+
+            /* acc2 +=  b[N-2] * x[n-N-4] + b[N-3] * x[n-N-5] */
+            acc2 = __SMLAD(x0, c0, acc2);
+
+            /* acc1 +=  b[N-2] * x[n-N-3] + b[N-3] * x[n-N-4] */
+            acc1 = __SMLADX(x1, c0, acc1);
+
+            /* pack  x[n-N-5] and x[n-N-6] */
+            x1 = __PKHBT(x2, x0, 0);
+
+            /* acc3 +=  b[N-2] * x[n-N-5] + b[N-3] * x[n-N-6] */
+            acc3 = __SMLADX(x1, c0, acc3);
+
+            /* Decrement tap count */
+            tapCnt--;
+        }
+
+        /* If the filter length is not a multiple of 4, compute the remaining filter taps.
+           This is always be 2 taps since the filter length is even. */
+        if ((numTaps & 0x3U) != 0U)
+        {
+            /* Read last two coefficients */
+            c0 = read_q15x2_ia((q15_t **)&pb);
+
+            /* Perform the multiply-accumulates */
+            acc0 = __SMLAD(x0, c0, acc0);
+            acc2 = __SMLAD(x2, c0, acc2);
+
+            /* pack state variables */
+            x1 = __PKHBT(x2, x0, 0);
+
+            /* Read last state variables */
+            x0 = read_q15x2(px);
+
+            /* Perform the multiply-accumulates */
+            acc1 = __SMLADX(x1, c0, acc1);
+
+            /* pack state variables */
+            x1 = __PKHBT(x0, x2, 0);
+
+            /* Perform the multiply-accumulates */
+            acc3 = __SMLADX(x1, c0, acc3);
+        }
+
+        /* The results in the 4 accumulators are in 2.30 format. Convert to 1.15 with saturation.
+           Then store the 4 outputs in the destination buffer. */
+#if defined(RISCV_MATH_DSP) && (__RISCV_XLEN == 64)
+        write_q15x4_ia(&pDst, __RV_PKBB32(__PKHBT(__SSAT((acc2 >> 15), 16), __SSAT((acc3 >> 15), 16), 16), __PKHBT(__SSAT((acc0 >> 15), 16), __SSAT((acc1 >> 15), 16), 16)));
+#else
+        write_q15x2_ia(&pDst, __PKHBT(__SSAT((acc0 >> 15), 16), __SSAT((acc1 >> 15), 16), 16));
+        write_q15x2_ia(&pDst, __PKHBT(__SSAT((acc2 >> 15), 16), __SSAT((acc3 >> 15), 16), 16));
+#endif /* (RISCV_MATH_DSP) && (__RISCV_XLEN == 64) */
+        /* Advance the state pointer by 4 to process the next group of 4 samples */
+        pState = pState + 4U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining output samples */
+    blkCnt = blockSize & 0x3U;
+
+#else
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* Copy two samples into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0;
+
+        /* Use SIMD to hold states and coefficients */
+        px = pState;
+        pb = pCoeffs;
+
+        tapCnt = numTaps >> 1U;
+
+        do
+        {
+            acc0 += (q31_t)*px++ * *pb++;
+            acc0 += (q31_t)*px++ * *pb++;
+
+            tapCnt--;
+        } while (tapCnt > 0U);
+
+        /* The result is in 2.30 format. Convert to 1.15 with saturation.
+           Then store the output in the destination buffer. */
+        *pDst++ = (q15_t)(__SSAT((acc0 >> 15), 16));
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 taps at a time */
+    tapCnt = (numTaps - 1U) >> 2U;
+
+    /* Copy data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+
+    /* Calculate remaining number of copies */
+    tapCnt = (numTaps - 1U) & 0x3U;
+
+#else
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+#endif /* defined (RISCV_MATH_VECTOR) */
+}
+
+#define multAcc_32x32_keep32_R(a, x, y) \
+    a = (q31_t)(((((q63_t)a) << 32) + ((q63_t)x * y) + 0x80000000LL) >> 32)
+
+RISCV_DSP_ATTRIBUTE void riscv_fir_fast_q31(
+    const riscv_fir_instance_q31 *S,
+    const q31_t *pSrc,
+    q31_t *pDst,
+    uint32_t blockSize)
+{
+    q31_t *pState = S->pState;         /* State pointer */
+    const q31_t *pCoeffs = S->pCoeffs; /* Coefficient pointer */
+    q31_t *pStateCurnt;                /* Points to the current sample of the state */
+    q31_t *px;                         /* Temporary pointer for state buffer */
+    const q31_t *pb;                   /* Temporary pointer for coefficient buffer */
+    q31_t acc0;                        /* Accumulators */
+    uint32_t numTaps = S->numTaps;     /* Number of filter coefficients in the filter */
+    uint32_t i, tapCnt, blkCnt;        /* Loop counters */
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+    q31_t acc1, acc2, acc3;   /* Accumulators */
+    q31_t x0, x1, x2, x3, c0; /* Temporary variables to hold state and coefficient values */
+#endif
+
+    /* S->pState points to state array which contains previous frame (numTaps - 1) samples */
+    /* pStateCurnt points to the location where the new input data should be written */
+    pStateCurnt = &(S->pState[(numTaps - 1U)]);
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 output values simultaneously.
+     * The variables acc0 ... acc3 hold output values that are being computed:
+     *
+     *    acc0 =  b[numTaps-1] * x[n-numTaps-1] + b[numTaps-2] * x[n-numTaps-2] + b[numTaps-3] * x[n-numTaps-3] +...+ b[0] * x[0]
+     *    acc1 =  b[numTaps-1] * x[n-numTaps]   + b[numTaps-2] * x[n-numTaps-1] + b[numTaps-3] * x[n-numTaps-2] +...+ b[0] * x[1]
+     *    acc2 =  b[numTaps-1] * x[n-numTaps+1] + b[numTaps-2] * x[n-numTaps]   + b[numTaps-3] * x[n-numTaps-1] +...+ b[0] * x[2]
+     *    acc3 =  b[numTaps-1] * x[n-numTaps+2] + b[numTaps-2] * x[n-numTaps+1] + b[numTaps-3] * x[n-numTaps]   +...+ b[0] * x[3]
+     */
+    blkCnt = blockSize >> 2U;
+
+    while (blkCnt > 0U)
+    {
+        /* Copy 4 new input samples into the state buffer. */
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set all accumulators to zero */
+        acc0 = 0;
+        acc1 = 0;
+        acc2 = 0;
+        acc3 = 0;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize coefficient pointer */
+        pb = pCoeffs;
+
+        /* Read the first 3 samples from the state buffer:
+         *  x[n-numTaps], x[n-numTaps-1], x[n-numTaps-2] */
+        x0 = *px++;
+        x1 = *px++;
+        x2 = *px++;
+
+        /* Loop unrolling. Process 4 taps at a time. */
+        tapCnt = numTaps >> 2U;
+
+        /* Loop over the number of taps.  Unroll by a factor of 4.
+           Repeat until we've computed numTaps-4 coefficients. */
+        while (tapCnt > 0U)
+        {
+            /* Read the b[numTaps] coefficient */
+            c0 = *pb;
+
+            /* Read x[n-numTaps-3] sample */
+            x3 = *px;
+
+            /* acc0 +=  b[numTaps] * x[n-numTaps] */
+            multAcc_32x32_keep32_R(acc0, x0, c0);
+
+            /* acc1 +=  b[numTaps] * x[n-numTaps-1] */
+            multAcc_32x32_keep32_R(acc1, x1, c0);
+
+            /* acc2 +=  b[numTaps] * x[n-numTaps-2] */
+            multAcc_32x32_keep32_R(acc2, x2, c0);
+
+            /* acc3 +=  b[numTaps] * x[n-numTaps-3] */
+            multAcc_32x32_keep32_R(acc3, x3, c0);
+
+            /* Read the b[numTaps-1] coefficient */
+            c0 = *(pb + 1U);
+
+            /* Read x[n-numTaps-4] sample */
+            x0 = *(px + 1U);
+
+            /* Perform the multiply-accumulates */
+            multAcc_32x32_keep32_R(acc0, x1, c0);
+            multAcc_32x32_keep32_R(acc1, x2, c0);
+            multAcc_32x32_keep32_R(acc2, x3, c0);
+            multAcc_32x32_keep32_R(acc3, x0, c0);
+
+            /* Read the b[numTaps-2] coefficient */
+            c0 = *(pb + 2U);
+
+            /* Read x[n-numTaps-5] sample */
+            x1 = *(px + 2U);
+
+            /* Perform the multiply-accumulates */
+            multAcc_32x32_keep32_R(acc0, x2, c0);
+            multAcc_32x32_keep32_R(acc1, x3, c0);
+            multAcc_32x32_keep32_R(acc2, x0, c0);
+            multAcc_32x32_keep32_R(acc3, x1, c0);
+
+            /* Read the b[numTaps-3] coefficients */
+            c0 = *(pb + 3U);
+
+            /* Read x[n-numTaps-6] sample */
+            x2 = *(px + 3U);
+
+            /* Perform the multiply-accumulates */
+            multAcc_32x32_keep32_R(acc0, x3, c0);
+            multAcc_32x32_keep32_R(acc1, x0, c0);
+            multAcc_32x32_keep32_R(acc2, x1, c0);
+            multAcc_32x32_keep32_R(acc3, x2, c0);
+
+            /* update coefficient pointer */
+            pb += 4U;
+            px += 4U;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* If the filter length is not a multiple of 4, compute the remaining filter taps */
+        tapCnt = numTaps % 0x4U;
+
+        while (tapCnt > 0U)
+        {
+            /* Read coefficients */
+            c0 = *(pb++);
+
+            /* Fetch 1 state variable */
+            x3 = *(px++);
+
+            /* Perform the multiply-accumulates */
+            multAcc_32x32_keep32_R(acc0, x0, c0);
+            multAcc_32x32_keep32_R(acc1, x1, c0);
+            multAcc_32x32_keep32_R(acc2, x2, c0);
+            multAcc_32x32_keep32_R(acc3, x3, c0);
+
+            /* Reuse the present sample states for next sample */
+            x0 = x1;
+            x1 = x2;
+            x2 = x3;
+
+            /* Decrement loop counter */
+            tapCnt--;
+        }
+
+        /* The results in the 4 accumulators are in 2.30 format. Convert to 1.31
+           Then store the 4 outputs in the destination buffer. */
+        *pDst++ = (q31_t)(acc0 << 1);
+        *pDst++ = (q31_t)(acc1 << 1);
+        *pDst++ = (q31_t)(acc2 << 1);
+        *pDst++ = (q31_t)(acc3 << 1);
+
+        /* Advance the state pointer by 4 to process the next group of 4 samples */
+        pState = pState + 4U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Loop unrolling: Compute remaining output samples */
+    blkCnt = blockSize % 0x4U;
+
+#else
+
+    /* Initialize blkCnt with number of taps */
+    blkCnt = blockSize;
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    while (blkCnt > 0U)
+    {
+        /* Copy one sample at a time into state buffer */
+        *pStateCurnt++ = *pSrc++;
+
+        /* Set the accumulator to zero */
+        acc0 = 0;
+
+        /* Initialize state pointer */
+        px = pState;
+
+        /* Initialize Coefficient pointer */
+        pb = pCoeffs;
+
+        i = numTaps;
+
+        /* Perform the multiply-accumulates */
+        do
+        {
+            multAcc_32x32_keep32_R(acc0, (*px++), (*pb++));
+            i--;
+        } while (i > 0U);
+
+        /* The result is in 2.30 format. Convert to 1.31
+           Then store the output in the destination buffer. */
+        *pDst++ = (q31_t)(acc0 << 1);
+
+        /* Advance state pointer by 1 for the next sample */
+        pState = pState + 1U;
+
+        /* Decrement loop counter */
+        blkCnt--;
+    }
+
+    /* Processing is complete.
+       Now copy the last numTaps - 1 samples to the start of the state buffer.
+       This prepares the state buffer for the next function call. */
+
+    /* Points to the start of the state buffer */
+    pStateCurnt = S->pState;
+
+#if defined(RISCV_MATH_LOOPUNROLL)
+
+    /* Loop unrolling: Compute 4 taps at a time */
+    tapCnt = (numTaps - 1U) >> 2U;
+
+    /* Copy data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement loop counter */
+        tapCnt--;
+    }
+
+    /* Calculate remaining number of copies */
+    tapCnt = (numTaps - 1U) & 0x3U;
+
+#else
+
+    /* Initialize tapCnt with number of taps */
+    tapCnt = (numTaps - 1U);
+
+#endif /* #if defined (RISCV_MATH_LOOPUNROLL) */
+
+    /* Copy remaining data */
+    while (tapCnt > 0U)
+    {
+        *pStateCurnt++ = *pState++;
+
+        /* Decrement the loop counter */
+        tapCnt--;
+    }
 }
