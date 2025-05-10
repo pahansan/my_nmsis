@@ -133,7 +133,6 @@ static inline void do_srand(void)
 {
     unsigned long randvar = __RV_CSR_READ(CSR_MCYCLE);
     srand(randvar);
-    // printf("srandvar is %d\n", randvar);
 }
 
 typedef int32_t q31_t;
